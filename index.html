@@ -57,7 +57,7 @@
   }
 })();
 </script>
-<title>UHC Pharmacy Manager v113</title>
+<title>UHC Pharmacy Manager v114</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -8595,17 +8595,99 @@ function doLoginSupabase() {
   toast('✅ Welcome ' + user.label + '! (' + (user.role === 'admin' ? '👑 Admin' : '👤 User') + ')');
 
   /* Background Supabase session (non-blocking, best-effort) */
+  /* Capture pass in closure immediately before function ends */
+  var _capturedPass = pass;
+  var _capturedUname = uname;
   if (_sb && navigator.onLine) {
-    var email = uname + '@uhc.local';
-    _sb.auth.signInWithPassword({ email: email, password: pass })
+    var _bgEmail = _capturedUname + '@uhc.local';
+    _sb.auth.signInWithPassword({ email: _bgEmail, password: _capturedPass })
       .then(function(res) {
         if (!res.error && res.data && res.data.user) {
           _sbUser = res.data.user;
-          _sbFetchRole(_sbUser.id).then(function(r) { _sbRole = r; });
-          console.log('[UHC] Supabase session established ☁️');
+          _sbRole = 'admin'; /* default until profile fetched */
+          _sbFetchRole(_sbUser.id).then(function(r) {
+            _sbRole = r;
+            console.log('[UHC] Supabase session established ☁️ role:', r);
+            /* Now sync any pending local data to Supabase */
+            _sbSyncPendingData();
+          });
+        } else {
+          console.warn('[UHC] Supabase bg login error:', res.error && res.error.message);
         }
       })
-      .catch(function(e) { console.warn('[UHC] Supabase bg login failed (ok):', e.message); });
+      .catch(function(e) {
+        console.warn('[UHC] Supabase bg login failed — will retry on next action:', e.message);
+        /* Retry once after 5 seconds */
+        setTimeout(function() {
+          if (_sb && navigator.onLine && !_sbUser) {
+            _sb.auth.signInWithPassword({ email: _bgEmail, password: _capturedPass })
+              .then(function(res2) {
+                if (!res2.error && res2.data && res2.data.user) {
+                  _sbUser = res2.data.user;
+                  _sbFetchRole(_sbUser.id).then(function(r) {
+                    _sbRole = r;
+                    console.log('[UHC] Supabase session established (retry) ☁️');
+                    _sbSyncPendingData();
+                  });
+                }
+              }).catch(function(){});
+          }
+        }, 5000);
+      });
+  }
+}
+
+/* ── Sync pending localStorage data to Supabase after session established ── */
+async function _sbSyncPendingData() {
+  if (!_sbReady()) return;
+  try {
+    /* Sync customers + transactions */
+    var custs = gd(K.cust) || {};
+    var names = Object.keys(custs);
+    if (!names.length) return;
+
+    console.log('[UHC] Syncing', names.length, 'customers to Supabase...');
+
+    for (var i = 0; i < names.length; i++) {
+      var name = names[i];
+      var c = custs[name];
+      if (!c || !c.txs || !c.txs.length) continue;
+
+      /* Upsert customer */
+      var custId = await _sbUpsertCustomer(name, c.phone || '', c.address || '');
+      if (!custId) continue;
+
+      /* Check existing transactions count in Supabase */
+      var existing = await _sb.from('customer_transactions')
+        .select('id', { count: 'exact', head: true })
+        .eq('customer_id', custId);
+      var existingCount = existing.count || 0;
+
+      /* Only insert if local has more than Supabase */
+      if (c.txs.length <= existingCount) continue;
+
+      /* Insert missing transactions */
+      var toInsert = c.txs.slice(existingCount).map(function(t) {
+        return {
+          customer_id : custId,
+          type        : t.type === 'rec' ? 'recovery' : t.type,
+          amount      : t.amt || 0,
+          tx_date     : t.date || todayKey(),
+          invoice     : t.invoice || null,
+          note        : t.note   || null,
+          method      : t.method || null
+        };
+      });
+
+      if (toInsert.length) {
+        var ins = await _sb.from('customer_transactions').insert(toInsert);
+        if (ins.error) console.warn('[UHC] Sync insert error:', ins.error.message);
+        else console.log('[UHC] Synced', toInsert.length, 'txs for', name);
+      }
+    }
+    toast('☁️ Data Supabase mein sync ho gaya!', '#059669');
+  } catch(e) {
+    console.error('[UHC] _sbSyncPendingData error:', e);
   }
 }
 
