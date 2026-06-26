@@ -57,7 +57,7 @@
   }
 })();
 </script>
-<title>UHC Pharmacy Manager v114</title>
+<title>UHC Pharmacy Manager v115</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -8420,6 +8420,7 @@ var _SB_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ
 var _sb = null; // Supabase client instance
 var _sbUser = null; // Current logged-in Supabase user
 var _sbRole = ''; // 'admin' | 'user'
+var _sbStoredUname = ''; // stored for reconnect
 
 /* Initialize Supabase client (safe — runs after CDN loads) */
 function _sbInit() {
@@ -8594,47 +8595,57 @@ function doLoginSupabase() {
   _afterLogin();
   toast('✅ Welcome ' + user.label + '! (' + (user.role === 'admin' ? '👑 Admin' : '👤 User') + ')');
 
-  /* Background Supabase session (non-blocking, best-effort) */
-  /* Capture pass in closure immediately before function ends */
-  var _capturedPass = pass;
-  var _capturedUname = uname;
-  if (_sb && navigator.onLine) {
-    var _bgEmail = _capturedUname + '@uhc.local';
-    _sb.auth.signInWithPassword({ email: _bgEmail, password: _capturedPass })
-      .then(function(res) {
-        if (!res.error && res.data && res.data.user) {
-          _sbUser = res.data.user;
-          _sbRole = 'admin'; /* default until profile fetched */
-          _sbFetchRole(_sbUser.id).then(function(r) {
-            _sbRole = r;
-            console.log('[UHC] Supabase session established ☁️ role:', r);
-            /* Now sync any pending local data to Supabase */
-            _sbSyncPendingData();
-          });
-        } else {
-          console.warn('[UHC] Supabase bg login error:', res.error && res.error.message);
-        }
-      })
-      .catch(function(e) {
-        console.warn('[UHC] Supabase bg login failed — will retry on next action:', e.message);
-        /* Retry once after 5 seconds */
-        setTimeout(function() {
-          if (_sb && navigator.onLine && !_sbUser) {
-            _sb.auth.signInWithPassword({ email: _bgEmail, password: _capturedPass })
-              .then(function(res2) {
-                if (!res2.error && res2.data && res2.data.user) {
-                  _sbUser = res2.data.user;
-                  _sbFetchRole(_sbUser.id).then(function(r) {
-                    _sbRole = r;
-                    console.log('[UHC] Supabase session established (retry) ☁️');
-                    _sbSyncPendingData();
-                  });
-                }
-              }).catch(function(){});
-          }
-        }, 5000);
+  /* Background Supabase connect */
+  _sbConnect(uname, pass);
+}
+
+/* ══ _sbConnect — robust Supabase session establisher ══
+   Call karo login ke baad ya kisi bhi action se pehle.
+   Agar already connected hai to skip karta hai.          */
+var _sbConnectInProgress = false;
+var _sbStoredPass = ''; /* login ke waqt store hota hai */
+
+function _sbConnect(uname, pass) {
+  /* Store credentials for retry */
+  if (uname) _sbStoredUname = uname;
+  if (pass)  _sbStoredPass  = pass;
+
+  /* Already connected */
+  if (_sbUser) { console.log('[UHC] _sbConnect: already connected'); return; }
+  /* Already in progress */
+  if (_sbConnectInProgress) return;
+  /* No Supabase client */
+  if (!_sb) { console.warn('[UHC] _sbConnect: _sb is null'); return; }
+
+  var email = (_sbStoredUname || 'ahmad') + '@uhc.local';
+  var pwd   = _sbStoredPass || '';
+
+  if (!pwd) { console.warn('[UHC] _sbConnect: no password stored'); return; }
+
+  _sbConnectInProgress = true;
+  console.log('[UHC] _sbConnect: attempting Supabase login for', email);
+
+  _sb.auth.signInWithPassword({ email: email, password: pwd })
+    .then(function(res) {
+      _sbConnectInProgress = false;
+      if (res.error) {
+        console.warn('[UHC] _sbConnect error:', res.error.message);
+        return;
+      }
+      _sbUser = res.data.user;
+      console.log('[UHC] _sbConnect: ✅ Supabase session established!');
+      _sbFetchRole(_sbUser.id).then(function(r) {
+        _sbRole = r;
+        console.log('[UHC] _sbConnect: role =', r);
+        _sbSyncPendingData();
       });
-  }
+    })
+    .catch(function(e) {
+      _sbConnectInProgress = false;
+      console.warn('[UHC] _sbConnect catch:', e.message);
+      /* Retry after 8 seconds */
+      setTimeout(function() { _sbConnect(null, null); }, 8000);
+    });
 }
 
 /* ── Sync pending localStorage data to Supabase after session established ── */
@@ -8878,6 +8889,8 @@ async function addCreditSupabase() {
   toast('✅ Credit add ho gaya');
 
   /* 4 — Supabase background sync (non-blocking) */
+  /* Try to connect if not already */
+  if (!_sbUser) _sbConnect(null, null);
   if (_sbReady()) {
     _sbUpsertCustomer(name, phone, address).then(function(custId) {
       if (!custId) { console.warn('[UHC] Customer Supabase mein save nahi hua'); return; }
